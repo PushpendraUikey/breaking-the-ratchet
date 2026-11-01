@@ -19,6 +19,7 @@
 #include <cerrno>
 #include <string>
 
+#include <csignal>
 #include <netdb.h>
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -36,7 +37,10 @@ namespace cfg {
     const int   SERVER_PORT   = 9000;
 }
 
-static bool g_verbose = false;   // -v: log everything, including poll traffic
+static bool g_verbose = false;                 // -v: log everything, including poll traffic
+static volatile sig_atomic_t g_run = 1;        // cleared by SIGINT for a clean exit
+
+static void on_sigint(int) { g_run = 0; }
 
 // Read the string value of a top-level "key":"value" pair (good enough for the
 // lab's one-line JSON frames; not a general JSON parser).
@@ -51,23 +55,22 @@ static std::string json_str_field(const std::string& line, const std::string& ke
 }
 
 // Decide whether a frame is worth printing. Poll traffic is the noise:
-//   - the request        {"type":"poll",...}
-//   - an empty response  {"type":"frames","frames":[]}
-// A non-empty "frames" response carries a real message, so keep it.
+//   - the request         {"type":"poll",...}
+//   - an empty response   {"type":"frames"}  or  {"type":"frames","frames":[]}
+// A "frames" response is logged ONLY when it actually carries a frame object.
 static bool should_log(const std::string& line) {
     if (g_verbose) return true;
     std::string type = json_str_field(line, "type");
     if (type == "poll") return false;
     if (type == "frames") {
-        // suppress only when the frames array is empty
+        // log only if there is a non-empty frames array, i.e. '[' then a '{'
         size_t p = line.find("\"frames\"");
-        if (p != std::string::npos) {
-            size_t b = line.find('[', p);
-            while (b != std::string::npos && b + 1 < line.size() &&
-                   (line[b + 1] == ' ' || line[b + 1] == '\t')) ++b;
-            if (b != std::string::npos && b + 1 < line.size() && line[b + 1] == ']')
-                return false;
-        }
+        if (p == std::string::npos) return false;        // no array at all -> empty
+        size_t b = line.find('[', p);
+        if (b == std::string::npos) return false;
+        size_t i = b + 1;
+        while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+        return i < line.size() && line[i] != ']';        // something inside -> log
     }
     return true;
 }
@@ -133,7 +136,7 @@ static void relay(int bob_fd, int srv_fd) {
     std::string buf_up, buf_down;  // up = Bob->server, down = server->Bob
     char data[8192];
 
-    for (;;) {
+    while (g_run) {
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(bob_fd, &rfds);
@@ -141,7 +144,7 @@ static void relay(int bob_fd, int srv_fd) {
         int maxfd = (bob_fd > srv_fd ? bob_fd : srv_fd) + 1;
 
         if (select(maxfd, &rfds, nullptr, nullptr, nullptr) < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) continue;   // g_run re-checked at loop top
             perror("select");
             break;
         }
@@ -178,30 +181,36 @@ int main(int argc, char** argv) {
     std::printf("[attack0] poll traffic: %s (use -v to show)\n",
                 g_verbose ? "shown" : "hidden");
 
+    // Clean exit on Ctrl+C: unblock accept()/select() and tear down.
+    struct sigaction sa{};
+    sa.sa_handler = on_sigint;      // no SA_RESTART -> accept()/select() return EINTR
+    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+
     int lfd = make_listener();
     if (lfd < 0) return 1;
 
-    // Handle one Bob connection at a time; loop so repeated runs don't need a restart.
-    for (;;) {
-        sockaddr_in peer{};
-        socklen_t plen = sizeof(peer);
-        int bob_fd = accept(lfd, (sockaddr*)&peer, &plen);
-        if (bob_fd < 0) { if (errno == EINTR) continue; perror("accept"); break; }
+    std::printf("[attack0] waiting for Bob...\n");
 
-        char ip[INET_ADDRSTRLEN] = {0};
-        inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
-        std::printf("[attack0] + client connected from %s:%d\n", ip, ntohs(peer.sin_port));
-
-        int srv_fd = dial_server();
-        if (srv_fd < 0) { close(bob_fd); continue; }
-
-        relay(bob_fd, srv_fd);
-
-        close(srv_fd);
-        close(bob_fd);
-        std::printf("[attack0] - connection closed\n");
+    // Serve the single Bob connection (it lasts the whole session), then exit.
+    int bob_fd = accept(lfd, nullptr, nullptr);
+    if (bob_fd < 0) {
+        if (errno == EINTR) std::printf("[attack0] interrupted; exiting.\n");
+        else perror("accept");
+        close(lfd);
+        return g_run ? 1 : 0;
     }
+    close(lfd);   // not accepting further connections
 
-    close(lfd);
+    std::printf("[attack0] + Bob connected\n");
+
+    int srv_fd = dial_server();
+    if (srv_fd < 0) { close(bob_fd); return 1; }
+
+    relay(bob_fd, srv_fd);
+
+    close(srv_fd);
+    close(bob_fd);
+    std::printf("[attack0] - connection closed; cleanup done, exiting.\n");
     return 0;
 }
