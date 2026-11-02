@@ -33,6 +33,7 @@ make
 | `--user U`       | username Mallory registers as (default `mallory`)       |
 | `--no-register`  | skip `register` (fetch is unauthenticated — confirmed)  |
 | `--count N`      | pull at most `N` OPKs (default: drain until empty)      |
+| `--concurrent K` | open `K` sockets, fire one fetch each at once (A.3 race)|
 | `--server ADDR`  | server address (default `127.0.0.1`)                    |
 | `--port N`       | server port (default `9000`)                            |
 
@@ -64,13 +65,28 @@ Test:
 3. Cap test: reset, then `./attack1 --count 3` — pulls exactly 3, leaves 2.
 4. Confirm the `opk_id`s walk down and never repeat within the run (A.4).
 
-### Step 3 — auth / rate-limit / impact probes
-- **No auth:** drain Bob while registered as `mallory` (not `alice`).
-- **No rate limit:** fire many rapid fetches back to back.
-- **Consequence:** after draining, have real **Alice** try to start a session
-  with Bob — does she fail (DoS) or proceed without an OPK (downgrade)?
-- **Concurrency (A.3):** open several connections and fetch at once; is the same
-  `opk_id` ever handed to two requests?
+### Step 3 — concurrency + consequence probes (current)
+Auth and rate-limit are already settled by Steps 1–2 (fetch works unregistered;
+all 5 fetches + the denial land in the same server-log second). Two things left:
+
+- **Concurrency (A.3) — code:** `./attack1 --concurrent K` opens `K` sockets,
+  registers each as `mallory0..malloryK`, then releases all `K` fetches at the
+  same instant (spin-flag barrier) and reports any `opk_id` handed to more than
+  one request. A duplicate means allocation is **not atomic** — two initiators
+  could share one "one-time" prekey. Reset Bob to 5 OPKs, run `--concurrent 5`
+  (or more); **re-run several times** — a race may only surface intermittently.
+- **Consequence — manual, the real impact:** after draining Bob (`./attack1`),
+  bring up real **Alice** and have her start a session with offline Bob:
+  ```sh
+  docker compose down -v && docker compose up as3_server   # T1
+  docker compose run --rm bob          # T2: publish, then exit (offline)
+  cd attack1 && ./attack1              # T3: drain all 5
+  docker compose run --rm alice        # T4: 1) message user -> bob
+  ```
+  Record which happens: Alice is **blocked** (DoS — can't start the session) or
+  she **proceeds without an OPK** (silent downgrade — the session loses the
+  one-time-prekey contribution to forward/break-in secrecy). Either way is the
+  security consequence; note the exact client/server messages.
 
 ### Step 4 — fix + report
 Write up A/B/C in the top-level `Report.md §4`; propose a fix (authenticate and
