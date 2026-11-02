@@ -65,9 +65,15 @@ Test:
 3. Cap test: reset, then `./attack1 --count 3` — pulls exactly 3, leaves 2.
 4. Confirm the `opk_id`s walk down and never repeat within the run (A.4).
 
-### Step 3 — concurrency + consequence probes (current)
-Auth and rate-limit are already settled by Steps 1–2 (fetch works unregistered;
-all 5 fetches + the denial land in the same server-log second). Two things left:
+### Step 3 — concurrency + consequence probes (done)
+Auth and rate-limit are settled by Steps 1–2 (fetch works unregistered; all 5
+fetches + the denial land in the same server-log second). Results:
+**concurrency** — no duplicate `opk_id` across repeated `--concurrent 2..5` runs
+despite genuinely interleaved completions, so allocation appears atomic (caveat:
+small race window with only 5 OPKs). **Consequence** — real Alice against a
+drained Bob gets `fetch_bundle(bob): no one-time prekeys available` and the
+message is **not sent**: a hard DoS, not a downgrade. Full write-up in
+`Report.md §4`. How the probes were run:
 
 - **Concurrency (A.3) — code:** `./attack1 --concurrent K` opens `K` sockets,
   registers each as `mallory0..malloryK`, then releases all `K` fetches at the
@@ -88,15 +94,21 @@ all 5 fetches + the denial land in the same server-log second). Two things left:
   one-time-prekey contribution to forward/break-in secrecy). Either way is the
   security consequence; note the exact client/server messages.
 
-### Step 4 — fix + report
-Write up A/B/C in the top-level `Report.md §4`; propose a fix (authenticate and
-rate-limit `fetch_bundle`; consume an OPK at message-receipt rather than at
-fetch; keep a signed-prekey fallback so exhaustion degrades gracefully).
+### Step 4 — fix + report (done)
+Written up as A/B/C/D in the top-level `Report.md §4`: OPK lifecycle, the three
+server weaknesses (unauthenticated / un-rate-limited / no fallback), the measured
+DoS consequence and concurrency result, and the proposed fix (authenticate and
+rate-limit `fetch_bundle`; reserve-at-fetch / consume-at-message rather than
+consume-at-fetch; signed-prekey fallback so exhaustion degrades gracefully).
 
-## Open questions to answer (spec Part A)
+## Spec Part A — answered (evidence in `Report.md §4`)
 
-1. How OPKs are generated, stored, published, and replenished.
-2. Does `fetch_bundle` consume an OPK, or does consumption happen at another
-   stage (e.g. first message)?
-3. Can the same OPK be allocated to multiple concurrent requests?
-4. What happens when no OPKs remain?
+1. **Generation/storage/publish/replenish:** Bob generates `OPK_COUNT=5` at
+   startup; `publish` uploads them; server stores a per-user pool keyed by
+   `opk_id`; no automatic replenishment — only a fresh `publish` refills it.
+2. **Does fetch consume?** Yes — one OPK popped per `fetch_bundle`, before any
+   message is sent.
+3. **Same OPK to concurrent requests?** Not observed — `--concurrent` never
+   produced a duplicate `opk_id`; allocation appears atomic (small-window caveat).
+4. **When none remain?** Hard `err: no one-time prekeys available` + server
+   `DENIED`; no empty-OPK fallback → the initiator (Alice) is blocked = DoS.
