@@ -31,13 +31,14 @@ session associated-data; nothing anchors the identity key to the real peer.
   frame to **decrypt her plaintext**; then `x3dh_initiate` to the real Bob,
   re-encrypt, and deliver — Bob sees a normal message, neither party detects
   anything. See the discovery story below and `Report.md §5`.
-- **Phase 3 — full bidirectional MITM (next).** Persist both ratchet sessions and
-  relay *both* directions (decrypt Bob→Alice on one session, re-encrypt on the
-  other), with DH-ratchet/skipped-key continuation so the whole conversation
-  flows while Mallory reads everything. (Currently Bob's *reply* fails on Alice —
-  expected, Phase 2 only handles Alice's first message.)
-- **Phase 4 — fix + report.** Out-of-band identity authentication
-  (safety-numbers / TOFU pinning); `Report.md §5.E`.
+- **Phase 3 — full bidirectional MITM (done, DEFAULT mode).** Mallory keeps **two
+  persistent Double Ratchet sessions** (one with Alice as responder, one with Bob
+  as initiator) and relays *both* directions: decrypt on the session a frame
+  arrives from, re-encrypt on the other, forward. DH-ratchet continuation is
+  handled on both sessions, so the whole conversation flows while Mallory reads
+  **every message both ways**. Verified on the live lab; `Report.md §5.D`.
+- **Phase 4 — fix.** Out-of-band identity authentication (safety-numbers / TOFU
+  pinning) with Python-style pseudocode; `Report.md §5.E`.
 
 Crypto: **OpenSSL 3** (X25519, HKDF-SHA256, HMAC-SHA256, ChaCha20-Poly1305-IETF)
 — already present; build with `-lssl -lcrypto`. Ed25519 is **not** needed because
@@ -108,28 +109,50 @@ passive logging relay (no `tshark` needed), capture one full session, decode it.
 - **Out-of-band verification:** confirm the client menu offers **no** identity
   fingerprint / safety-number check (Trust model A.4).
 
-## Phase 2 — run the attack (recovery + transparent forward)
+## Run the attack
 
 Mallory *replaces* the server, so do **not** run `as3_server`. Reset client state
 first so a fresh X3DH actually happens.
 
+### Phase 3 — full bidirectional MITM (default)
+
 ```sh
 docker compose down -v                                     # reset
 cd attack2 && make && ./attack2                            # T1 — malicious server on :9000
-docker compose run --rm bob   /client --server-addr host.docker.internal --port 9000   # T2: msg user->alice, wait
-docker compose run --rm alice /client --server-addr host.docker.internal --port 9000   # T3: msg user->bob, send ONE line
+docker compose run --rm bob   /client --server-addr host.docker.internal --port 9000   # T2
+docker compose run --rm alice /client --server-addr host.docker.internal --port 9000   # T3
 ```
 
-Expect on **T1**: `AD format discovered: …` then `RECOVERED PLAINTEXT …` then
-`re-encrypted for bob and delivered`. On **T2**, Bob displays the message normally
-(`[alice] …`). Bob's *reply* to Alice fails on Alice for now — that is Phase 3.
+Have Alice and Bob exchange **several lines back and forth**. On **T1** each line
+prints in order as it is recovered:
 
-Offline sanity check (no lab needed): `./attack2 --selftest`.
+```
+[attack2] AD format discovered: prefix=dh_raw  header=empty
+[attack2]  alice -> bob  #1 : "Hello Bob, What are you doing?"
+[attack2]  bob -> alice  #1 : "I'm doing good, wbu"
+[attack2]  alice -> bob  #2 : "I'm good as well. What are you upto these days?"
+```
+
+Both clients display every message normally and detect nothing.
+
+### Phase 2 — single-message recovery (incremental demo)
+
+`./attack2 --phase2` runs the original single-shot path: it decrypts Alice's
+**first** message and forwards it, printing `RECOVERED PLAINTEXT …`. Bob's reply
+then fails on Alice (`AEAD authentication failed`) — the exact gap Phase 3 closes,
+useful to show the "fails authentication" evidence class.
+
+### Offline sanity checks (no lab needed)
+
+- `./attack2 --selftest` — Phase 2 single-message crypto plumbing.
+- `./attack2 --selftest-full` — Phase 3 bidirectional, multi-message, including
+  each party's DH-ratchet turn (all recovered and delivered intact).
 
 ## Files
 
 - `attack2.cpp` — the malicious server (OpenSSL): protocol + key substitution +
-  recovery + transparent forward + AD-format discovery sweep + `--selftest`.
+  full bidirectional two-session MITM (default) + Phase 2 single-shot (`--phase2`)
+  + AD-format discovery sweep + `--selftest` / `--selftest-full`.
 - `Makefile` — `make` / `make clean` (links `-lssl -lcrypto -pthread`).
 - `observe/relay.py` — passive logging relay (forwards unchanged, dumps raw
   newline-JSON to stdout). Phase-0 capture tool; replaces `tshark`.

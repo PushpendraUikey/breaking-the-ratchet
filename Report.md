@@ -358,6 +358,16 @@ from the untrusted server.
    bundle (which she holds as the server), re-encrypts the recovered plaintext,
    and delivers it to Bob, who decrypts it with his real keys and sees a normal
    message from "alice". Neither party detects anything.
+4. **Two separate sessions, both directions.** Mallory keeps **two independent
+   Double Ratchet sessions** alive for the whole conversation — one with Alice
+   (Mallory as responder) and one with Bob (Mallory as initiator). Every frame is
+   decrypted on the session it arrives from and re-encrypted on the other before
+   forwarding, and each party's DH-ratchet turn is carried through on both
+   sessions. Alice↔Bob therefore chat normally end-to-end while Mallory reads and
+   relays **every message in both directions**. This is exactly the separation the
+   task asks to demonstrate: *"establish separate sessions with Alice and Bob,
+   decrypt messages received in each session, and forward messages to the other
+   party."*
 
 Because Ed25519 is never verified, the attack needs only four primitives: X25519,
 HKDF-SHA256, HMAC-SHA256, and ChaCha20-Poly1305-IETF.
@@ -393,51 +403,115 @@ byte layout of `st.AD`. We pinned it down empirically:
    convention produced a frame Bob decrypted cleanly — confirming the end-to-end
    transparent MITM for the first message.
 
-### 5.D Result so far (Phase 2) and the path to a full MITM
+### 5.D Result — full bidirectional MITM (verified on the live lab)
 
-**Phase 2 (done):** one genuine run recovered Alice's first message
-(`"Hello bob what are you doing bro?"`) *and* delivered it to the real Bob
-transparently — Bob displayed it as a normal message from "alice" and detected
-nothing; Alice saw only the usual `SPK sig NOT verified` warning she ignores. This
-already demonstrates the required evidence distinction: a message the server
-**merely forwards** (any frame outside the MITM'd pair), a message whose plaintext
-the server **recovers** (Alice→Bob), and a message that **fails authentication**
-(a tampered or wrong-session frame).
+We built the attack in two verified stages and completed it:
 
-**Phase 3 (in progress) — what is left for a complete MITM.** Phase 2 handles a
-single direction and a single message, so Bob's *reply* currently fails on Alice
-(she sees `AEAD authentication failed`, as expected). A full, seamless MITM needs:
+- **Phase 2** — recover + forward Alice's *first* message only (single direction).
+  Kept in the code as `--phase2` so the incremental story is demonstrable.
+- **Phase 3 (final)** — persistent two-session relay reading the **whole
+  conversation in both directions**. This is the default mode.
 
-- **Persistent per-session ratchet state.** Keep both the Alice↔Mallory and
-  Mallory↔Bob `Ratchet` states alive across the whole conversation instead of
-  rebuilding for one message.
-- **Reverse direction.** Decrypt Bob→Alice frames on the Mallory↔Bob session and
-  re-encrypt them on the Alice↔Mallory session (and vice-versa), so both parties
-  keep chatting normally.
-- **DH-ratchet continuation and skipped keys.** Handle the symmetric-chain steps
-  and the DH-ratchet steps that occur when a side flips (the `pn`/new-`dh`
-  transitions we observed), including out-of-order/skipped message keys.
-- **Consistency hardening.** Optionally forward to Bob using a real OPK so his log
-  shows `OPK id=N` rather than `0` (a minor artefact a careful observer could
-  notice).
+**Live run (genuine Docker clients through the malicious server):**
 
-### 5.E Proposed fix (preview; full pseudocode with Phase 3)
+```
+[attack2] stored REAL bob bundle (for forwarding)
+[attack2] SUBSTITUTED bundle served for bob
+[attack2] AD format discovered: prefix=dh_raw  header=empty
+[attack2]  alice -> bob  #1 : "Hello Bob, What are you doing?"
+[attack2]  bob -> alice  #1 : "I'm doing good, wbu"
+[attack2]  alice -> bob  #2 : "I'm good as well. What are you upto these days?"
+```
 
-Authenticate identity keys out of band: compare safety numbers / fingerprints
-(a hash of both identity keys) over an independent channel, or pin on first use
-(TOFU) and alert on change; and verify `spk_sig` against the *pinned* identity
-key. No server-side fix alone suffices, since the server is the adversary.
+Both clients displayed every line normally; Alice saw only the `SPK sig NOT
+verified` warning she already ignores, and Bob saw ordinary messages from
+"alice". An offline multi-message self-test (`--selftest-full`) independently
+confirms the ratchet continuation, including each party's DH-ratchet turn
+(A→B, B→A, and A→B-after-ratchet all recovered and delivered intact).
+
+**Required evidence distinction (task B).** The three cases are all observable:
+
+| Case | Example in this attack | How it shows up |
+|------|------------------------|-----------------|
+| Server **merely forwards** | any frame outside the MITM'd pair (e.g. a `poll`, or a message to a third user) | queued to the mailbox unchanged, no plaintext line printed |
+| Server **recovers plaintext** | every Alice↔Bob frame, both directions | printed as `alice -> bob #n : "…"` / `bob -> alice #n : "…"` after `aead_decrypt` succeeds on the correct session |
+| **Fails authentication** | a tampered/wrong-session frame, or — in `--phase2` mode — Bob's *reply*, which has no Mallory↔Alice sending session to match | `aead_decrypt` returns false → `AEAD authentication failed` on the client; Phase 3 removes this by maintaining both sessions |
+
+This directly answers task B: Mallory establishes **two separate sessions**,
+**decrypts in each**, and **forwards to the other party**, with the three evidence
+classes distinguished.
+
+### 5.E Proposed fix (Python-style pseudocode)
+
+**Root cause.** Identity keys are delivered by the untrusted server and never
+authenticated out of band (§5.A). No server-side change helps, because the server
+*is* the adversary. The fix must let Alice and Bob confirm each other's identity
+key over a channel the server does not control, and bind the signed prekey to that
+authenticated identity.
+
+```python
+# --- (1) Safety number: a short, comparable fingerprint of BOTH identity keys ---
+# Mallory cannot forge it: she does not hold Alice's or Bob's real IK private key,
+# and any key she substitutes changes the number both parties compute.
+def safety_number(my_ik_pub, peer_ik_pub):
+    a, b = sorted([my_ik_pub, peer_ik_pub])          # order-independent
+    digest = SHA256(b"AS3-SAFETY-v1" + a + b)
+    return base10_groups(digest[:30], groups=6)       # e.g. 6 x 5-digit blocks
+
+# Alice and Bob read these aloud / scan a QR in person or over an already-trusted
+# channel. If the numbers differ, a key was substituted -> abort.
+
+# --- (2) Trust On First Use (TOFU) + change alerts, for when (1) is impractical ---
+def on_bundle_received(peer, bundle):
+    # (2a) Verify spk_sig against the IK *in the bundle* (necessary, not sufficient).
+    if not ed25519_verify(bundle.ik_sig_pub, bundle.spk, bundle.spk_sig):
+        abort("signed prekey signature invalid")
+
+    pinned = trust_store.get(peer)                    # local, not server-controlled
+    if pinned is None:
+        trust_store.put(peer, bundle.ik_dh)           # pin on first contact
+    elif pinned != bundle.ik_dh:
+        # The identity key changed -> possible MITM or legitimate reinstall.
+        alert_user("%s's identity key CHANGED — verify safety number before sending"
+                   % peer)
+        require_manual_reverification(peer)           # block until user confirms
+
+    # (2b) Bind the signed prekey to the PINNED identity, not just the bundle's.
+    if not ed25519_verify(trust_store.get(peer), bundle.spk, bundle.spk_sig):
+        abort("spk not signed by the pinned identity key")
+
+# --- (3) Only after identity is trusted, run X3DH as before. ---
+def start_session(peer, bundle):
+    on_bundle_received(peer, bundle)                  # gate the whole handshake
+    return x3dh_initiate(bundle)
+```
+
+**Assumptions.** (i) At least one out-of-band channel exists for the initial
+safety-number comparison (in person, phone, or a QR scan) — standard for
+Signal/WhatsApp. (ii) Each client has local, server-independent storage for pinned
+identity keys. (iii) Ed25519 signatures are actually checked (the current client
+skips this — see §5.A — so fixing that is itself a prerequisite).
+
+**How Alice and Bob detect the malicious server.** Under the substitution attack
+Alice is handed Mallory's `ik_dh`, so the safety number Alice computes
+(`SHA256(IK_alice ‖ IK_mallory)`) differs from the one Bob computes
+(`SHA256(IK_mallory' ‖ IK_bob)`); the mismatch on comparison reveals the MITM.
+With TOFU, the first session pins the real key and any later substitution raises
+the "identity key changed" alert. Either way the detection happens **off the
+server's path**, which is the only place a fix can live when the server is the
+attacker.
 
 ---
 
 ## Appendix A — Generative AI usage
 
-Generative AI (Claude, via Claude Code) was used as an assistant throughout
-Attacks 0 and 1: to analyse `protocol.md`, develop the proofs-of-concept in
+Generative AI (Claude, via Claude Code) was used as an assistant throughout all
+three attacks: to analyse `protocol.md`, develop the proofs-of-concept in
 stages (Attack 0: transparent relay → single-field tampering → accumulate/flood
 amplifiers; Attack 1: single fetch → drain loop → concurrency/consequence
-probes), design the boundary and measurement experiments, and interpret the
-results.
+probes; Attack 2: passive observation relay → honest server → key substitution +
+first-message recovery → full bidirectional two-session MITM), design the
+boundary and measurement experiments, and interpret the results.
 
 Verification was empirical and adversarial to the model's own claims:
 
@@ -456,9 +530,20 @@ Verification was empirical and adversarial to the model's own claims:
 - The proof-of-concept code was compiled (`-Wall -Wextra`, no warnings) and run
   against the lab; observed client/server logs were cross-checked against the
   protocol pseudocode.
+- For Attack 2, the model's *assumed* AEAD associated-data layout (literal
+  `st.AD + serialize(header)`) **passed the offline self-test but failed the live
+  decrypt**; the real format (`AD = ik_dh_initiator ‖ ik_dh_responder`, header not
+  bound) was then recovered by a brute-force discovery sweep over the running
+  lab's own ciphertext — a measured result, not a prediction. Both the Phase 2
+  single-message and Phase 3 bidirectional MITM were confirmed end-to-end on the
+  live Docker clients, and an offline `--selftest-full` independently checks the
+  ratchet continuation.
 
 Representative prompts: "learn the assignment from the spec and protocol";
 "implement the counter tampering as Step 2"; "what is the other implementation
 flaw that permits resource exhaustion?"; "implement accumulating and flood
 modes"; "analyse these `docker stats` results"; "make a skeleton for attack1 and
-proceed in steps"; "build the drain loop"; "add a concurrency probe".
+proceed in steps"; "build the drain loop"; "add a concurrency probe"; "propose a
+plan to observe what Attack 2 needs"; "write the MITM that decrypts Alice's first
+message with neither party detecting it"; "complete the full bidirectional
+Mallory".
