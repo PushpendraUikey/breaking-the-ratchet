@@ -16,27 +16,52 @@ identity key *in the same bundle*, so it does not detect substitution.
 Root cause (see `protocol.md` §3): X3DH binds identity keys only into the
 session associated-data; nothing anchors the identity key to the real peer.
 
-## Plan (staged; decide depth after Phase 0)
+## Staged development (what we built, in order)
 
-- **Phase 0 — observe (current, no attack code).** Capture a genuine Alice↔Bob
-  session and record the bundle/header layout + whether the client verifies the
-  SPK signature. Answers the trust-model questions (A.1–A.4) with evidence and
-  locks the wire format the server must reproduce. Tooling: `observe/inspect.py`.
-- **Phase 1 — honest malicious server.** A faithful C++/OpenSSL server
-  (`register/publish/fetch_bundle/send/poll`) so Alice and Bob talk through it
-  normally — proves we are protocol-correct and in-path; logs frames it merely
-  forwards (cannot read).
-- **Phase 2 — key substitution + plaintext recovery.** Return Mallory's keys on
-  `fetch_bundle(bob)`, run `x3dh_respond` on Alice's first frame, **print the
-  recovered plaintext**. The confidentiality break.
-- **Phase 3 — full transparent MITM (optional).** Also initiate a session to
-  Bob, re-encrypt, and relay both directions with ratchet continuation.
+- **Phase 0 — observe (done).** Captured a genuine Alice↔Bob session through a
+  passive relay and decoded it. Established the bundle/header layout and the
+  decisive trust-model facts: the SPK signature is **not verified**
+  (`warn: SPK sig NOT verified`) and there is **no out-of-band identity check**.
+  Tooling: `observe/relay.py`, `observe/inspect.py`.
+- **Phase 1 — honest server (folded into Phase 2).** A faithful C++/OpenSSL server
+  (`register/publish/fetch_bundle/send/poll` + mailboxes) so the clients behave
+  normally and Mallory is in-path.
+- **Phase 2 — key substitution + recovery + transparent forward (done).** On
+  `fetch_bundle(bob)` return Mallory's keys; `x3dh_respond` on Alice's first
+  frame to **decrypt her plaintext**; then `x3dh_initiate` to the real Bob,
+  re-encrypt, and deliver — Bob sees a normal message, neither party detects
+  anything. See the discovery story below and `Report.md §5`.
+- **Phase 3 — full bidirectional MITM (next).** Persist both ratchet sessions and
+  relay *both* directions (decrypt Bob→Alice on one session, re-encrypt on the
+  other), with DH-ratchet/skipped-key continuation so the whole conversation
+  flows while Mallory reads everything. (Currently Bob's *reply* fails on Alice —
+  expected, Phase 2 only handles Alice's first message.)
 - **Phase 4 — fix + report.** Out-of-band identity authentication
-  (safety-numbers / TOFU pinning); write `Report.md §5`.
+  (safety-numbers / TOFU pinning); `Report.md §5.E`.
 
-Crypto: **OpenSSL 3** (X25519, Ed25519, HKDF-SHA256, HMAC-SHA256,
-ChaCha20-Poly1305-IETF) — already present; no install. Build later with
-`-lssl -lcrypto`.
+Crypto: **OpenSSL 3** (X25519, HKDF-SHA256, HMAC-SHA256, ChaCha20-Poly1305-IETF)
+— already present; build with `-lssl -lcrypto`. Ed25519 is **not** needed because
+the client does not verify the SPK signature.
+
+## How we found the AEAD associated-data format
+
+The spec leaves `serialize(header)` / the raw layout of `st.AD` under-specified,
+so we discovered the Go client's exact convention empirically:
+
+1. Assumed the spec's literal `ad = st.AD + serialize(header)` (compact header,
+   raw `IK‖IK`). An offline **self-test** (`./attack2 --selftest`) passed → crypto
+   plumbing correct.
+2. The **live run failed** to decrypt → the fault was byte-format compatibility,
+   not the maths.
+3. Added a **discovery sweep**: compute the first-message key once, then
+   brute-force the associated data over `{IK_dh raw/b64, IK_sig raw/b64, reversed,
+   none} × {compact, spaced, pn-n-dh, wire+init, empty}` and report the
+   combination whose Poly1305 tag validates.
+4. **Result:** `prefix = ik_dh raw`, `header = empty` — i.e.
+   **`AD = ik_dh_initiator ‖ ik_dh_responder` (64 raw bytes); the header is NOT
+   bound into the AEAD.** A successful decrypt also confirmed all X3DH/ratchet
+   constants match the spec. (This corrects the Attack-0 mechanism note: counter
+   tampering is detected via the key schedule, not an AD mismatch.)
 
 ## Phase 0 — observation runbook
 
@@ -83,9 +108,29 @@ passive logging relay (no `tshark` needed), capture one full session, decode it.
 - **Out-of-band verification:** confirm the client menu offers **no** identity
   fingerprint / safety-number check (Trust model A.4).
 
+## Phase 2 — run the attack (recovery + transparent forward)
+
+Mallory *replaces* the server, so do **not** run `as3_server`. Reset client state
+first so a fresh X3DH actually happens.
+
+```sh
+docker compose down -v                                     # reset
+cd attack2 && make && ./attack2                            # T1 — malicious server on :9000
+docker compose run --rm bob   /client --server-addr host.docker.internal --port 9000   # T2: msg user->alice, wait
+docker compose run --rm alice /client --server-addr host.docker.internal --port 9000   # T3: msg user->bob, send ONE line
+```
+
+Expect on **T1**: `AD format discovered: …` then `RECOVERED PLAINTEXT …` then
+`re-encrypted for bob and delivered`. On **T2**, Bob displays the message normally
+(`[alice] …`). Bob's *reply* to Alice fails on Alice for now — that is Phase 3.
+
+Offline sanity check (no lab needed): `./attack2 --selftest`.
+
 ## Files
 
+- `attack2.cpp` — the malicious server (OpenSSL): protocol + key substitution +
+  recovery + transparent forward + AD-format discovery sweep + `--selftest`.
+- `Makefile` — `make` / `make clean` (links `-lssl -lcrypto -pthread`).
 - `observe/relay.py` — passive logging relay (forwards unchanged, dumps raw
   newline-JSON to stdout). Phase-0 capture tool; replaces `tshark`.
 - `observe/inspect.py` — decodes captured frames (base64 field sizes, header JSON).
-- (Phase 1+ will add `attack2.cpp` + `Makefile`.)
